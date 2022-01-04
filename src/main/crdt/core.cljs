@@ -1,27 +1,33 @@
-(ns crdt.core)
+(ns crdt.core
+  (:refer-clojure :exclude [-compare]))
+
+(set! *warn-on-infer* false)
+
+(defn start [] (prn "start"))
 
 (defprotocol ICRDT
+  (-value [c])
   (-merge [this other]))
 
 (defprotocol ICounter
-  (-value [c])
   (-inc [c replica-id])
   (-dec [c replica-id]))
 
 (deftype GCounter [m]
   ICounter
-  (-value [_] (->> m vals (reduce +)))
   (-inc [_ replica-id] (GCounter. (assoc m replica-id (inc (or (m replica-id) 0)))))
   (-dec [_ _] (throw (ex-info "GCounter don't implement -dec" nil)))
 
   ICRDT
-  (-merge [this other] (GCounter. (merge-with max m (.-m other))))
+  (-value [_] (->> m vals (reduce +)))
+  (-merge [this ^GCounter other] (GCounter. (merge-with max m (.-m other))))
 
   IPrintWithWriter
   (-pr-writer [o writer opts]
     (write-all writer (str "GCounter[" m "]"))))
 
 (set! (.-EMPTY GCounter) (->GCounter {}))
+
 
 (comment
   (def g (.-EMPTY GCounter))
@@ -48,18 +54,68 @@
 
   )
 
+(defprotocol IVClock
+  (-compare [this other]))
+
+
+(deftype VClock [^GCounter gcounter]
+  Object
+  (inc [this replica-id]
+    (VClock. (-inc gcounter replica-id)))
+  ICRDT
+  (-merge [_ other]
+    (VClock. (-merge gcounter (.-gcounter other))))
+  (-value [_] (-value gcounter))
+  IVClock
+  (-compare [_ other]
+    (let [m1 (.-m gcounter)
+          m2 (.. other -gcounter -m)]
+      (reduce (fn [r k]
+                (let [v1 (get m1 k 0)
+                      v2 (get m2 k 0)]
+                  (case [r (compare v1 v2)]
+                    [:EQ -1] :LT
+                    [:EQ 1]  :GT
+                    [:LT 1]  (reduced :CC)
+                    [:GT -1] (reduced :CC)
+                    r)))
+              :EQ (into (set (keys m1)) (keys m2)))))
+  IPrintWithWriter
+  (-pr-writer [o writer opts]
+    (write-all writer (str "VClock[" (.-m gcounter) "]"))))
+
+(set! (.-EMPTY VClock) (VClock. (.-EMPTY GCounter)))
+
+(comment
+  (def c1 (-> (.-EMPTY VClock)
+              (.inc :id1)
+              (.inc :id1)))
+  (def c2 (-> (.-EMPTY VClock)
+              (.inc :id2)
+              (.inc :id2)))
+  (prn (-compare c1 c2))
+  (set! c1 (-merge c1 c2))
+  (set! c2 c1)
+  (set! c1 (-> c1
+               (.inc :id1)
+               (.inc :id1)))
+  (prn (-compare c1 c2))
+  (set! c2 (-> c2
+               (.inc :id2)))
+  (prn (-compare c1 c2))
+  )
 
 (deftype PNCounter [inc-m dec-m]
   ICounter
-  (-value [_] (- (->> inc-m vals (reduce +))
-                 (->> dec-m vals (reduce +))))
   (-inc [_ replica-id]
     (PNCounter. (assoc inc-m replica-id (inc (or (inc-m replica-id) 0))) dec-m))
   (-dec [_ replica-id]
     (PNCounter. inc-m (assoc dec-m replica-id (inc (or (dec-m replica-id) 0)))))
 
   ICRDT
-  (-merge [this other]
+  (-value [_] (- (->> inc-m vals (reduce +))
+                 (->> dec-m vals (reduce +))))
+  (-merge [this ^PNCounter other]
     (PNCounter. (merge-with max inc-m (.-inc-m other))
                 (merge-with max dec-m (.-dec-m other))))
 
@@ -94,4 +150,143 @@
   (def g3 (-merge g1 g2))
   (prn g1 g2 g3)
   (prn (-value g3))
+  )
+
+
+(defprotocol IRegister
+  (-set [this v t]))
+
+(deftype LWWReg [v time]
+  IRegister
+  (-set [this newv t] (if (< time t) (LWWReg. newv t) this))
+
+  ICRDT
+  (-value [this] v)
+  (-merge [this other] (if (< time (.-time other)) other this)))
+
+(set! (.-EMPTY LWWReg) (LWWReg. nil nil))
+
+
+(deftype GSet [set]
+  ICollection
+  (-conj [_ o] (GSet. (conj set o)))
+  ICRDT
+  (-value [_] set)
+  (-merge [_ other] (GSet. (clojure.set/union set (.-set other)))))
+
+(set! (.-EMPTY GSet) (GSet. #{}))
+
+(deftype PSet [add-set rem-set]
+  ICollection
+  (-conj [_ o] (PSet. (conj add-set o) rem-set))
+  ISet
+  (-disjoin [_ v] (PSet. add-set (conj rem-set v)))
+  ICRDT
+  (-value [_] (clojure.set/difference add-set rem-set))
+  (-merge [_ ^PSet other] (PSet. (clojure.set/union add-set (.-add-set other))
+                                 (clojure.set/union rem-set (.-rem-set other)))))
+(set! (.-EMPTY PSet) (PSet. #{} #{}))
+
+(comment
+  (def s1 (.-EMPTY PSet))
+  (def s2 (.-EMPTY PSet))
+  (set! s1 (-> s1
+               (conj 1)
+               (conj 2)
+               (conj 3)))
+  (set! s2 (-> s2
+               (conj 1)
+               (disj 2)))
+  (def s3 (-merge s1 s2))
+  (prn (-value s3))
+  (set! s3 (conj s3 2))
+  (prn (-value s3)))
+
+
+(defprotocol IReplicaAddRemove
+  (-add [this v replica-id])
+  (-remove [this v replica-id]))
+
+
+(deftype ORSet [add-m rem-m]
+  ICRDT
+  (-value [_]
+    (->> rem-m
+         (reduce (fn [r [v rem-vc]]
+                   (let [add-vc (get r v (.-EMPTY VClock))]
+                     (if (= :LT (-compare add-vc rem-vc))
+                       (dissoc r v)
+                       r)))
+                 add-m)
+         keys
+         set))
+
+  (-merge [_ other]
+    (let [add-m* (merge-with (fn [vc1 vc2] (-merge vc1 vc2)) add-m (.-add-m other))
+          rem-m* (merge-with (fn [vc1 vc2] (-merge vc1 vc2)) rem-m (.-rem-m other))
+          [add-m** rem-m**]
+          (reduce (fn [[add-m rem-m] [v rem-vc]]
+                    (if-let [add-vc (get add-m v)]
+                      (if (= :LT (-compare add-vc rem-vc))
+                        [(dissoc add-m v) (assoc rem-m v rem-vc)]
+                        [add-m rem-m])
+                      [add-m (assoc rem-m v rem-vc)]))
+                  [add-m* {}] rem-m*)]
+      (ORSet. add-m** rem-m**)))
+  IReplicaAddRemove
+  (-add [_ v replica-id]
+    (let [add-vc (get add-m v)
+          rem-vc (get rem-m v)]
+      (cond
+        (some? add-vc)
+        (ORSet. (assoc add-m v (.inc add-vc replica-id)) (dissoc rem-m v))
+
+        (some? rem-vc)
+        (ORSet. (assoc add-m v (.inc rem-vc replica-id)) (dissoc rem-m v))
+
+        :else
+        (ORSet. (assoc add-m v (.inc (.-EMPTY VClock) replica-id)) rem-m))))
+
+  (-remove [_ v replica-id]
+    (let [add-vc (get add-m v)
+          rem-vc (get rem-m v)]
+      (cond
+        (some? add-vc)
+        (ORSet. (dissoc add-m v) (assoc rem-m v (.inc add-vc replica-id)))
+
+        (some? rem-vc)
+        (ORSet. (dissoc add-m v) (assoc rem-m v (.inc rem-vc replica-id)))
+
+        :else
+        (ORSet. add-m (assoc rem-m v (.inc (.-EMPTY VClock) replica-id))))))
+
+  IPrintWithWriter
+  (-pr-writer [o writer opts]
+    (write-all writer (str "ORSet[" add-m "," rem-m "]"))))
+
+(set! (.-EMPTY ORSet) (ORSet. {} {}))
+
+(comment
+  (def s1 (-> (.-EMPTY ORSet)
+              (-add 1 :id1)
+              (-add 2 :id1)
+              (-remove 1 :id1)))
+  (def s2 (-> (.-EMPTY ORSet)
+              (-add 3 :id2)
+              (-add 4 :id2)))
+  (def s3 (-merge s1 s2))
+  (prn s1)
+  (prn s2)
+  (prn s3)
+  (prn (-value s3))
+  (def s4 s3)
+  (set! s3 (-> s3
+               (-remove 2 :id2)
+               (-add 2 :id2)
+               (-add 3 :id2)))
+  (prn (-value s3))
+  (set! s4 (-> s4
+               (-remove 2 :id1)))
+  (prn (-value s4))
+  (prn (-value (-merge s3 s4)))
   )

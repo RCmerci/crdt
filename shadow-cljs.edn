@@ -1,0 +1,20 @@
+;; shadow-cljs configuration
+{:http {:port 9631}
+ :dev-http {1234 "target"}
+ :source-paths
+ ["src/dev"
+  "src/main"
+  "src/test"]
+
+ :dependencies
+ [[cider/cider-nrepl "0.27.0"]
+  [binaryage/devtools "1.0.2"]]
+
+ :builds
+ {:lib {:target :browser
+        :output-dir "target/js"
+        :modules {:main {:entries [crdt.core]}}
+        :compiler-options {:infer-externs :auto}
+        :devtools {:after-load crdt.core/start
+                   :preloads [devtools.preload
+                              shadow.remote.runtime.cljs.browser]}}}}
