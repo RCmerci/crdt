@@ -16,10 +16,10 @@
 (deftype GCounter [m]
   ICounter
   (-inc [_ replica-id] (GCounter. (assoc m replica-id (inc (or (m replica-id) 0)))))
-  (-dec [_ _] (throw (ex-info "GCounter don't implement -dec" nil)))
+  (-dec [_ _] (throw (ex-info "GCounter didn't implement -dec" nil)))
 
   ICRDT
-  (-value [_] (->> m vals (reduce +)))
+  (-value [_] (->> m vals (apply +)))
   (-merge [this ^GCounter other] (GCounter. (merge-with max m (.-m other))))
 
   IPrintWithWriter
@@ -289,4 +289,60 @@
                (-remove 2 :id1)))
   (prn (-value s4))
   (prn (-value (-merge s3 s4)))
+  )
+
+
+;;;;;;;;;;;;;;;;;
+;; delta state ;;
+;;;;;;;;;;;;;;;;;
+
+(defprotocol IDeltaCRDT
+  (-merge-delta [this delta])
+  (-split [this]))
+
+(deftype DeltaGCounter [m ^DeltaGCounter-or-nil delta]
+  ICounter
+  (-inc [_ replica-id]
+    (let [m* (assoc m replica-id (inc (or (m replica-id) 0)))]
+      (DeltaGCounter. m* (let [d (or delta (.-EMPTY DeltaGCounter))]
+                                (DeltaGCounter. (conj (.-m d) (find m* replica-id)) nil)))))
+  (-dec [_ _]
+    (throw (ex-info "DeltaGCounter didn't impl -dec" nil)))
+  ICRDT
+  (-value [_] (-> m vals (apply +)))
+  (-merge [_ other] (DeltaGCounter. (merge-with max m (.-m other))
+                                    (some-> (merge-with max (some-> delta .-m) (some-> other .-delta .-m))
+                                            (DeltaGCounter. nil))))
+  IDeltaCRDT
+  (-merge-delta [this delta] (-merge this delta))
+  (-split [_] [(DeltaGCounter. m nil) delta])
+
+  IPrintWithWriter
+  (-pr-writer [o writer opts]
+    (write-all writer (str "DeltaGCounter[" m "," (pr-str delta) "]"))))
+
+(set! (.-EMPTY DeltaGCounter) (DeltaGCounter. {} nil))
+
+(comment
+  (def d1 (-> (.-EMPTY DeltaGCounter)
+              (-inc :id1)
+              (-inc :id1)))
+  (def d2 (-> (.-EMPTY DeltaGCounter)
+              (-inc :id2)))
+  (set! d1 (-merge d1 d2))
+  (set! d2 (-merge d1 d2))
+  (prn "d1" d1)
+  (prn "d2" d2)
+  (set! d1 (first (-split d1)))
+  (set! d1 (-> d1
+               (-inc :id1)))
+  (prn "d1" d1)
+  (let [[d1* delta1] (-split d1)]
+    (prn "delta1" delta1)
+    (prn "d2" d2)
+    (set! d2 (-merge-delta d2 delta1))
+    (prn "d2" d2)
+    (set! d1 d1*))
+  (prn "d1" d1)
+  (prn "d2" d2)
   )
