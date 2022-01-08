@@ -393,3 +393,47 @@
   (prn "d1 value" (-value d1))
   (prn "d2 value" (-value d2))
   )
+
+(deftype DeltaGSet [set delta]
+  ICollection
+  (-conj [_ o]
+    (let [d (or delta (.-EMPTY DeltaGSet))]
+      (DeltaGSet. (conj set o) (DeltaGSet. (conj (.-set d) o) nil))))
+  ICRDT
+  (-value [_] set)
+  (-merge [_ other]
+    (DeltaGSet. (clojure.set/union set (.-set other))
+                (DeltaGSet. (clojure.set/union (some-> delta .-set)
+                                               (some-> other .-delta .-set)) nil)))
+  IDeltaCRDT
+  (-merge-delta [this delta] (-merge this delta))
+  (-split [_] [(DeltaGSet. set nil) delta])
+  IPrintWithWriter
+  (-pr-writer [o writer opts]
+    (write-all writer (str "DeltaGSet[" set "," (pr-str delta) "]"))))
+
+(set! (.-EMPTY DeltaGSet) (DeltaGSet. #{} nil))
+
+(comment
+  (def d1 (-> (.-EMPTY DeltaGSet)
+              (conj 1)
+              (conj 2)))
+  (def d2 (-> (.-EMPTY DeltaGSet)
+              (conj 3)
+              (conj 4)))
+  (prn "d1" d1)
+  (prn "d2" d2)
+  (set! d1 (-merge d1 d2))
+  (set! d2 (-merge d1 d2))
+  (set! d1 (first (-split d1)))
+  (set! d1 (-> d1 (-conj 5) (-conj 6)))
+  (let [[d1* delta1] (-split d1)]
+    (prn "delta1" delta1)
+    (set! d2 (-merge-delta d2 delta1))
+    (prn "d2" d2)
+    (set! d1 d1*))
+  (prn "d1" d1)
+  (prn "d2" d2)
+  (prn "d1 value" (-value d1))
+  (prn "d2 value" (-value d2))
+  )
