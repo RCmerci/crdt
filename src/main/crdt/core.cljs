@@ -309,7 +309,7 @@
   (-dec [_ _]
     (throw (ex-info "DeltaGCounter didn't impl -dec" nil)))
   ICRDT
-  (-value [_] (-> m vals (apply +)))
+  (-value [_] (->> m vals (apply +)))
   (-merge [_ other] (DeltaGCounter. (merge-with max m (.-m other))
                                     (some-> (merge-with max (some-> delta .-m) (some-> other .-delta .-m))
                                             (DeltaGCounter. nil))))
@@ -345,4 +345,51 @@
     (set! d1 d1*))
   (prn "d1" d1)
   (prn "d2" d2)
+  )
+
+(deftype DeltaPNCounter [inc-gcounter dec-gcounter]
+  ICounter
+  (-inc [_ replica-id]
+    (DeltaPNCounter. (-inc inc-gcounter replica-id) dec-gcounter))
+  (-dec [_ replica-id]
+    (DeltaPNCounter. inc-gcounter (-inc dec-gcounter replica-id)))
+  ICRDT
+  (-value [_] (- (-value inc-gcounter) (-value dec-gcounter)))
+  (-merge [_ other] (DeltaPNCounter. (-merge inc-gcounter (.-inc-gcounter other))
+                                     (-merge dec-gcounter (.-dec-gcounter other))))
+  IDeltaCRDT
+  (-merge-delta [this delta] (-merge this delta))
+  (-split [_]
+    (let [[inc-g inc-delta] (-split inc-gcounter)
+          [dec-g dec-delta] (-split dec-gcounter)]
+      [(DeltaPNCounter. inc-g dec-g) (DeltaPNCounter. inc-delta dec-delta)]))
+
+  IPrintWithWriter
+  (-pr-writer [o writer opts]
+    (write-all writer (str "DeltaPNCounter[" (pr-str inc-gcounter) "," (pr-str dec-gcounter) "]"))))
+(set! (.-EMPTY DeltaPNCounter) (DeltaPNCounter. (.-EMPTY DeltaGCounter) (.-EMPTY DeltaGCounter)))
+
+(comment
+  (def d1 (-> (.-EMPTY DeltaPNCounter)
+              (-inc :id1)
+              (-dec :id1)
+              (-inc :id1)))
+  (def d2 (-> (.-EMPTY DeltaPNCounter)
+              (-inc :id2)
+              (-inc :id2)))
+  (set! d1 (-merge d1 d2))
+  (set! d2 (-merge d1 d2))
+  (prn "d1" d1)
+  (prn "d2" d2)
+  (set! d1 (first (-split d1)))
+  (set! d1 (-> d1 (-inc :id1) (-dec :id1)))
+  (let [[d1* delta1] (-split d1)]
+    (prn "delta1" delta1)
+    (set! d2 (-merge-delta d2 delta1))
+    (prn "d2" d2)
+    (set! d1 d1*))
+  (prn "d1" d1)
+  (prn "d2" d2)
+  (prn "d1 value" (-value d1))
+  (prn "d2 value" (-value d2))
   )
